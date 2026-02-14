@@ -206,7 +206,8 @@ class LogicHandler:
         
         # Step 1
         print("\n=== [Step 1] Scale Estimation ===")
-        client.parameters.timeout = 2000
+        # 【修正】タイムアウトを2000msから10000ms(10秒)へ延長
+        client.parameters.timeout = 10000 
         model_step1 = model_constraints
         result_step1 = solve(model_step1, client)
         
@@ -239,7 +240,8 @@ class LogicHandler:
             model_final += (obj / s) * w
             print(f"{key}: Scale = {s:.4f}, Weight = {w}")
             
-        client.parameters.timeout = 4000
+        # 【修正】タイムアウトを4000msから20000ms(20秒)へ延長
+        client.parameters.timeout = 20000 
         result = solve(model_final, client)
         
         plot_data = []
