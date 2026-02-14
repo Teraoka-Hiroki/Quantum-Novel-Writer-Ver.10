@@ -32,7 +32,7 @@ class DraftItem:
         self.text = text
         self.type = type
         self.relevance = float(relevance)
-        # JSONから復元した際にattributesが辞書でない場合のガード
+        # JSON復元時のガード
         self.attributes = attributes if isinstance(attributes, dict) else {}
         self.selected = selected
         self.user_rating = int(user_rating)
@@ -60,7 +60,6 @@ class LogicHandler:
     
     @staticmethod
     def _safe_generate(model, prompt, retries=3):
-        """Rate Limit対策を強化した生成メソッド"""
         for i in range(retries):
             try:
                 response = model.generate_content(prompt)
@@ -87,7 +86,7 @@ class LogicHandler:
     @staticmethod
     def generate_candidates_api(api_key, topic_main, topic_sub1, topic_sub2, params, target_type=None):
         if not HAS_GENAI: raise Exception("gemini lib missing")
-        if not api_key: raise Exception("Gemini APIキーが設定されていません。タブ1で入力してください。")
+        if not api_key: raise Exception("Gemini APIキーが設定されていません。")
         
         genai.configure(api_key=api_key)
         model = genai.GenerativeModel("gemini-2.5-flash")
@@ -193,22 +192,23 @@ class LogicHandler:
     @staticmethod
     def _solve_multi_stage(token, model_objs, model_constraints, q, candidates, target_length, weights):
         if not candidates:
-            # ここでエラーが出ているので、server.pyのワーカー設定が重要
-            raise Exception("最適化する候補がありません。ファイルをアップロードし直すか、生成してください。")
+            raise Exception("最適化する候補がありません。")
 
         client = FixstarsClient()
         client.token = token
         
-        def get_val(values, idx):
+        # 【重要】結果取得用ヘルパー関数：変数を直接評価して値(0 or 1)を取得する
+        def get_val(values, variable):
             if values is None: return 0
             try:
-                if isinstance(values, dict): return values.get(idx, 0)
-                if hasattr(values, '__getitem__'): return values[idx]
-            except: pass
-            return 0
+                # VariableGeneratorの変数を直接evaluateメソッドで評価
+                # これが最も確実な値の取り出し方です
+                return variable.evaluate(values)
+            except:
+                return 0
         
         # Step 1
-        client.parameters.timeout = 3000 
+        client.parameters.timeout = 5000 
         print("\n=== [Step 1] Scale Estimation ===")
         
         scales = {}
@@ -222,7 +222,8 @@ class LogicHandler:
                 values_step1 = result_step1[0].values
 
             if values_step1 is not None:
-                approx_len = sum([len(c.text) for i, c in enumerate(candidates) if get_val(values_step1, i) > 0.5])
+                # 修正: q[i]を直接渡す
+                approx_len = sum([len(c.text) for i, c in enumerate(candidates) if get_val(values_step1, q[i]) > 0.5])
                 print(f"Step1 Approx Length: {approx_len} (Target: {target_length})")
                 
                 for key, obj in model_objs.items():
@@ -237,11 +238,13 @@ class LogicHandler:
             for key in model_objs.keys(): scales[key] = 1.0
             
         # Step 2
-        client.parameters.timeout = 5000 
+        # タイムアウトを10秒に延長して解の探索時間を確保
+        client.parameters.timeout = 10000 
         print("\n=== [Step 2] Weighted Optimization ===")
         
         w_constraint = weights.get('constraint', 1.0)
-        model_final = model_constraints * w_constraint
+        # 制約の重みを少し強くする (x1.5)
+        model_final = model_constraints * (w_constraint * 1.5)
         
         for key, obj in model_objs.items():
             s = scales[key]
@@ -250,7 +253,7 @@ class LogicHandler:
             print(f"{key}: Scale = {s:.4f}, Weight = {w}")
             
         if not hasattr(model_final, 'evaluate'):
-             raise Exception("最適化モデルに変数が含まれていません。候補リストを確認してください。")
+             raise Exception("最適化モデルに変数が含まれていません。")
 
         result = solve(model_final, client)
         
@@ -281,12 +284,26 @@ class LogicHandler:
         if hasattr(result, 'best'): values = result.best.values
         elif isinstance(result, list) and len(result) > 0: values = result[0].values
         
+        # フォールバック判定：Step2で何も選択されなかった場合、Step1の結果を採用
+        step2_has_selection = False
+        if values is not None:
+            for i in range(len(candidates)):
+                # 修正: q[i]を直接渡して評価
+                if get_val(values, q[i]) > 0.5:
+                    step2_has_selection = True
+                    break
+        
+        if not step2_has_selection and values_step1 is not None:
+             values = values_step1
+             print("Step 2 yield no selection. Reverting to Step 1 results.")
+        
         updated_candidates = []
         final_selected_len = 0
         
         print("\n=== Final Results ===")
         for i, c in enumerate(candidates):
-            val = get_val(values, i)
+            # 修正: q[i]を直接渡して評価
+            val = get_val(values, q[i])
             c.selected = (val > 0.5)
             if c.selected:
                 final_selected_len += len(c.text)
@@ -345,7 +362,7 @@ class LogicHandler:
         
         h_user_pref = 0
         for i in range(len(candidates)):
-            # 【重要】型変換エラーを防ぐためfloat()でキャスト
+            # floatキャスト
             pred_score = float(predicted[i])
             h_user_pref -= pred_score * q[i]
             
