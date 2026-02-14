@@ -18,7 +18,7 @@ try:
 except: HAS_GENAI = False
 
 try:
-    # 【修正】Amplify v1対応: VariableGeneratorを使用
+    # Amplify v1対応: VariableGeneratorを使用
     from amplify import VariableGenerator, FixstarsClient, solve
     HAS_AMPLIFY = True
 except: HAS_AMPLIFY = False
@@ -184,23 +184,26 @@ class LogicHandler:
             t = target_s if c.type == "Scene Craft" else target_c
             for k, tv in t.items():
                 cost_i += (c.attributes.get(k, 0.5) - tv) ** 2
+            # 1.0 - relevance はfloat計算なのでOK
             cost_i += (1.0 - c.relevance)
+            # cost_iはfloatなので、q[i] (Poly) との積はPolyになる
             h_param_diff += cost_i * q[i]
         return h_param_diff
 
     @staticmethod
     def _solve_multi_stage(token, model_objs, model_constraints, q, candidates, target_length, weights):
+        if not candidates:
+            raise Exception("最適化する候補がありません。")
+
         client = FixstarsClient()
         client.token = token
         
-        # 【修正】Amplify v1での結果取得用ヘルパー関数
+        # Amplify v1の結果取得用ヘルパー関数
         def get_bit_value(values, idx):
             if values is None: return 0
-            # v1では dict {index: value} の形式で返ることが多いため、インデックスでアクセス
             try:
                 if isinstance(values, dict):
                     return values.get(idx, 0)
-                # あるいは配列アクセス
                 if hasattr(values, '__getitem__'):
                     return values[idx]
             except: pass
@@ -210,31 +213,43 @@ class LogicHandler:
         print("\n=== [Step 1] Scale Estimation ===")
         client.parameters.timeout = 10000 
         model_step1 = model_constraints
-        result_step1 = solve(model_step1, client)
         
-        scales = {}
-        values_step1 = None
-        
-        # 【修正】Amplify v1の結果オブジェクト構造に対応
-        # v1では result.solutions が存在するか、best プロパティを確認
-        if hasattr(result_step1, 'best'):
-            values_step1 = result_step1.best.values
-        elif isinstance(result_step1, list) and len(result_step1) > 0:
-            values_step1 = result_step1[0].values
-        
-        if values_step1 is not None:
-            approx_len = sum([len(c.text) for i, c in enumerate(candidates) if get_bit_value(values_step1, i) > 0.5])
-            print(f"Step1 Approx Length: {approx_len} (Target: {target_length})")
-            for key, obj in model_objs.items():
-                # v1: evaluate(values) メソッド
-                val = abs(obj.evaluate(values_step1))
-                scales[key] = max(val, 0.1)
+        # model_step1が純粋な数値(float)になっていないかチェック
+        # 変数を含まない式(定数)だとsolveでエラーになるため
+        if not hasattr(model_step1, 'evaluate'): 
+             # AmplifyのPoly型でない場合(=変数がない場合)、最適化不要
+             print("Warning: Model has no variables. Skipping Step 1.")
+             values_step1 = None
+             scales = {k: 1.0 for k in model_objs.keys()}
         else:
-            for key in model_objs.keys(): scales[key] = 1.0
+            result_step1 = solve(model_step1, client)
+            
+            scales = {}
+            values_step1 = None
+            
+            if hasattr(result_step1, 'best'):
+                values_step1 = result_step1.best.values
+            elif isinstance(result_step1, list) and len(result_step1) > 0:
+                values_step1 = result_step1[0].values
+            
+            if values_step1 is not None:
+                approx_len = sum([len(c.text) for i, c in enumerate(candidates) if get_bit_value(values_step1, i) > 0.5])
+                print(f"Step1 Approx Length: {approx_len} (Target: {target_length})")
+                for key, obj in model_objs.items():
+                    # objがPolyであることを確認してからevaluate
+                    if hasattr(obj, 'evaluate'):
+                        val = abs(obj.evaluate(values_step1))
+                        scales[key] = max(val, 0.1)
+                    else:
+                        scales[key] = 1.0
+            else:
+                for key in model_objs.keys(): scales[key] = 1.0
             
         # Step 2
         print("\n=== [Step 2] Weighted Optimization ===")
         w_constraint = weights.get('constraint', 1.0)
+        
+        # ベースの制約項からスタート
         model_final = model_constraints * w_constraint
         print(f"Constraint: Weight = {w_constraint}")
 
@@ -245,6 +260,11 @@ class LogicHandler:
             print(f"{key}: Scale = {s:.4f}, Weight = {w}")
             
         client.parameters.timeout = 20000 
+        
+        # 最終モデルが定数でないか確認
+        if not hasattr(model_final, 'evaluate'):
+             raise Exception("最適化モデルに変数が含まれていません。候補リストを確認してください。")
+
         result = solve(model_final, client)
         
         plot_data = []
@@ -307,7 +327,6 @@ class LogicHandler:
         if not HAS_AMPLIFY: raise Exception("Amplify missing")
         candidates = [DraftItem.from_dict(d) for d in candidates_dict]
         
-        # 【修正】Amplify v1対応: VariableGeneratorで変数を作成
         gen = VariableGenerator()
         q = gen.array("Binary", len(candidates))
         
@@ -341,13 +360,14 @@ class LogicHandler:
         current_vectors = [LogicHandler._create_vector(c) for c in candidates]
         predicted = model_svr.predict(current_vectors) if X_train else [3.0]*len(candidates)
         
-        # 【修正】Amplify v1対応: VariableGeneratorで変数を作成
         gen = VariableGenerator()
         q = gen.array("Binary", len(candidates))
         
         h_user_pref = 0
         for i in range(len(candidates)):
-            h_user_pref -= predicted[i] * q[i]
+            # 【重要】NumPyの型(numpy.float64)だとAmplifyがエラーになるため、float()でキャスト
+            coeff = float(predicted[i])
+            h_user_pref -= coeff * q[i]
             
         h_param_diff = LogicHandler._construct_param_objective(q, candidates, params)
         current_len = sum([len(c.text) * q[i] for i, c in enumerate(candidates)])
