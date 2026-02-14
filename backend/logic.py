@@ -18,7 +18,8 @@ try:
 except: HAS_GENAI = False
 
 try:
-    from amplify import BinarySymbolGenerator, FixstarsClient, solve
+    # 【修正】Amplify v1対応: VariableGeneratorを使用
+    from amplify import VariableGenerator, FixstarsClient, solve
     HAS_AMPLIFY = True
 except: HAS_AMPLIFY = False
 
@@ -192,21 +193,21 @@ class LogicHandler:
         client = FixstarsClient()
         client.token = token
         
-        def get_bit_value(values, var, idx):
+        # 【修正】Amplify v1での結果取得用ヘルパー関数
+        def get_bit_value(values, idx):
             if values is None: return 0
-            try: return var.evaluate(values)
-            except: pass
-            try: return values[var]
-            except: pass
+            # v1では dict {index: value} の形式で返ることが多いため、インデックスでアクセス
             try:
-                if isinstance(values, dict): return values.get(idx, 0)
-                if hasattr(values, '__getitem__'): return values[idx]
+                if isinstance(values, dict):
+                    return values.get(idx, 0)
+                # あるいは配列アクセス
+                if hasattr(values, '__getitem__'):
+                    return values[idx]
             except: pass
             return 0
         
         # Step 1
         print("\n=== [Step 1] Scale Estimation ===")
-        # 【修正】タイムアウトを2000msから10000ms(10秒)へ延長
         client.parameters.timeout = 10000 
         model_step1 = model_constraints
         result_step1 = solve(model_step1, client)
@@ -214,15 +215,18 @@ class LogicHandler:
         scales = {}
         values_step1 = None
         
+        # 【修正】Amplify v1の結果オブジェクト構造に対応
+        # v1では result.solutions が存在するか、best プロパティを確認
         if hasattr(result_step1, 'best'):
             values_step1 = result_step1.best.values
         elif isinstance(result_step1, list) and len(result_step1) > 0:
             values_step1 = result_step1[0].values
         
         if values_step1 is not None:
-            approx_len = sum([len(c.text) for i, c in enumerate(candidates) if get_bit_value(values_step1, q[i], i) > 0.5])
+            approx_len = sum([len(c.text) for i, c in enumerate(candidates) if get_bit_value(values_step1, i) > 0.5])
             print(f"Step1 Approx Length: {approx_len} (Target: {target_length})")
             for key, obj in model_objs.items():
+                # v1: evaluate(values) メソッド
                 val = abs(obj.evaluate(values_step1))
                 scales[key] = max(val, 0.1)
         else:
@@ -240,7 +244,6 @@ class LogicHandler:
             model_final += (obj / s) * w
             print(f"{key}: Scale = {s:.4f}, Weight = {w}")
             
-        # 【修正】タイムアウトを4000msから20000ms(20秒)へ延長
         client.parameters.timeout = 20000 
         result = solve(model_final, client)
         
@@ -274,7 +277,7 @@ class LogicHandler:
         step2_has_selection = False
         if values is not None:
             for i in range(len(candidates)):
-                if get_bit_value(values, q[i], i) > 0.5:
+                if get_bit_value(values, i) > 0.5:
                     step2_has_selection = True
                     break
         if not step2_has_selection and values_step1 is not None:
@@ -286,7 +289,7 @@ class LogicHandler:
         
         print("\n=== Final Results ===")
         for i, c in enumerate(candidates):
-            val = get_bit_value(values, q[i], i)
+            val = get_bit_value(values, i)
             c.selected = (val > 0.5)
             if c.selected:
                 final_selected_len += len(c.text)
@@ -303,8 +306,10 @@ class LogicHandler:
     def run_parameter_optimization_multi(token, candidates_dict, params):
         if not HAS_AMPLIFY: raise Exception("Amplify missing")
         candidates = [DraftItem.from_dict(d) for d in candidates_dict]
-        gen = BinarySymbolGenerator()
-        q = gen.array(len(candidates))
+        
+        # 【修正】Amplify v1対応: VariableGeneratorで変数を作成
+        gen = VariableGenerator()
+        q = gen.array("Binary", len(candidates))
         
         h_param_diff = LogicHandler._construct_param_objective(q, candidates, params)
         current_len = sum([len(c.text) * q[i] for i, c in enumerate(candidates)])
@@ -336,8 +341,9 @@ class LogicHandler:
         current_vectors = [LogicHandler._create_vector(c) for c in candidates]
         predicted = model_svr.predict(current_vectors) if X_train else [3.0]*len(candidates)
         
-        gen = BinarySymbolGenerator()
-        q = gen.array(len(candidates))
+        # 【修正】Amplify v1対応: VariableGeneratorで変数を作成
+        gen = VariableGenerator()
+        q = gen.array("Binary", len(candidates))
         
         h_user_pref = 0
         for i in range(len(candidates)):
