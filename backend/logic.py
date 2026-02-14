@@ -2,6 +2,7 @@ import json
 import warnings
 import numpy as np
 import time
+import random
 from typing import List, Dict, Any
 
 try:
@@ -18,7 +19,7 @@ try:
 except: HAS_GENAI = False
 
 try:
-    # Amplify v1対応: VariableGeneratorを使用
+    # Amplify v1対応
     from amplify import VariableGenerator, FixstarsClient, solve
     HAS_AMPLIFY = True
 except: HAS_AMPLIFY = False
@@ -49,18 +50,23 @@ class DraftItem:
 class LogicHandler:
     
     @staticmethod
-    def _safe_generate(model, prompt, retries=5):
-        """Generates content with aggressive exponential backoff for rate limits."""
+    def _safe_generate(model, prompt, retries=3):
+        """
+        429エラー(Rate Limit)対策を強化した生成メソッド
+        """
         for i in range(retries):
             try:
                 response = model.generate_content(prompt)
                 return response.text
             except Exception as e:
                 err_str = str(e).lower()
+                # 429エラーまたはResource Exhaustedの場合
                 if "429" in err_str or "quota" in err_str or "resource exhausted" in err_str:
                     if i < retries - 1:
-                        sleep_time = 5 * (2 ** i)
-                        print(f"Quota exceeded, retrying in {sleep_time}s...")
+                        # 待機時間を大幅に増やす (初回10秒, 次20秒...)
+                        # 無料枠の回復を待つため
+                        sleep_time = 10 * (i + 1) + random.uniform(1, 5)
+                        print(f"Rate limit hit. Retrying in {sleep_time:.1f}s...")
                         time.sleep(sleep_time)
                         continue
                 raise e
@@ -82,8 +88,7 @@ class LogicHandler:
         genai.configure(api_key=api_key)
         model = genai.GenerativeModel("gemini-2.5-flash")
         
-        # パラメータの値を文字列化してプロンプトに埋め込む準備
-        # 0.0(低) 〜 1.0(高)
+        # パラメータ取得
         p_desc = params.get('p_desc_style', 0.5)
         p_pers = params.get('p_perspective', 0.5)
         p_sens = params.get('p_sensory', 0.5)
@@ -97,7 +102,7 @@ class LogicHandler:
         p_c_tru = params.get('p_char_trauma', 0.0)
         p_c_voi = params.get('p_char_voice', 0.5)
 
-        # ターゲットタイプに応じたプロンプトの構築
+        # プロンプト構築
         if target_type == "Scene Craft":
             instruction = f"""
             「Scene Craft」（シーン描写）の執筆ブロックを１０個生成してください。各ブロック記事は１４０字程度にしてください。
@@ -133,8 +138,7 @@ class LogicHandler:
             json_format = '{{ "type": "Character Dynamics", "text": "...", "scores": {{ "relevance": 0.5, "char_count": 0.2, "char_mental": 0.5, "char_belief": 0.5, "char_trauma": 0.0, "char_voice": 0.5 }} }}'
         
         else:
-            # フォールバック
-            instruction = "「Scene Craft」（シーン描写）１０個と「Character Dynamics」（キャラクター造形）１０個、合計２０個の執筆ブロックを生成してください。各ブロック記事は１４０字程度にしてください。"
+            instruction = "「Scene Craft」（シーン描写）と「Character Dynamics」（キャラクター造形）を合計１０個生成してください。"
             json_format = '{{ "type": "...", "text": "...", "scores": {{ ... }} }}'
 
         prompt = f"""
@@ -183,11 +187,14 @@ class LogicHandler:
             cost_i = 0
             t = target_s if c.type == "Scene Craft" else target_c
             for k, tv in t.items():
-                cost_i += (c.attributes.get(k, 0.5) - tv) ** 2
-            # 1.0 - relevance はfloat計算なのでOK
-            cost_i += (1.0 - c.relevance)
-            # cost_iはfloatなので、q[i] (Poly) との積はPolyになる
-            h_param_diff += cost_i * q[i]
+                # 属性差分の二乗誤差 (float計算)
+                val = float(c.attributes.get(k, 0.5))
+                cost_i += (val - float(tv)) ** 2
+            
+            cost_i += (1.0 - float(c.relevance))
+            # Amplifyの変数q[i]と掛ける際、cost_iは必ずPythonのfloatにする
+            h_param_diff += float(cost_i) * q[i]
+            
         return h_param_diff
 
     @staticmethod
@@ -198,45 +205,41 @@ class LogicHandler:
         client = FixstarsClient()
         client.token = token
         
-        # Amplify v1の結果取得用ヘルパー関数
-        def get_bit_value(values, idx):
+        # Amplify v1の結果取得用ヘルパー（辞書アクセスを安全に）
+        def get_val(values, idx):
             if values is None: return 0
             try:
+                # v1: {0: 1, 1: 0, ...} のような辞書形式が多い
                 if isinstance(values, dict):
                     return values.get(idx, 0)
+                # 配列の場合
                 if hasattr(values, '__getitem__'):
                     return values[idx]
             except: pass
             return 0
         
-        # Step 1
+        # === Step 1: スケール推定 ===
+        # タイムアウトを短縮 (20s -> 3s) : 候補数が少ないため十分
+        client.parameters.timeout = 3000 
         print("\n=== [Step 1] Scale Estimation ===")
-        client.parameters.timeout = 10000 
-        model_step1 = model_constraints
         
-        # model_step1が純粋な数値(float)になっていないかチェック
-        # 変数を含まない式(定数)だとsolveでエラーになるため
-        if not hasattr(model_step1, 'evaluate'): 
-             # AmplifyのPoly型でない場合(=変数がない場合)、最適化不要
-             print("Warning: Model has no variables. Skipping Step 1.")
-             values_step1 = None
-             scales = {k: 1.0 for k in model_objs.keys()}
-        else:
-            result_step1 = solve(model_step1, client)
-            
-            scales = {}
-            values_step1 = None
-            
+        scales = {}
+        values_step1 = None
+        
+        # 定数項のみでないかチェック
+        if hasattr(model_constraints, 'evaluate'): 
+            result_step1 = solve(model_constraints, client)
             if hasattr(result_step1, 'best'):
                 values_step1 = result_step1.best.values
             elif isinstance(result_step1, list) and len(result_step1) > 0:
                 values_step1 = result_step1[0].values
-            
+
             if values_step1 is not None:
-                approx_len = sum([len(c.text) for i, c in enumerate(candidates) if get_bit_value(values_step1, i) > 0.5])
+                # 選択された文字数の概算表示
+                approx_len = sum([len(c.text) for i, c in enumerate(candidates) if get_val(values_step1, i) > 0.5])
                 print(f"Step1 Approx Length: {approx_len} (Target: {target_length})")
+                
                 for key, obj in model_objs.items():
-                    # objがPolyであることを確認してからevaluate
                     if hasattr(obj, 'evaluate'):
                         val = abs(obj.evaluate(values_step1))
                         scales[key] = max(val, 0.1)
@@ -244,29 +247,31 @@ class LogicHandler:
                         scales[key] = 1.0
             else:
                 for key in model_objs.keys(): scales[key] = 1.0
+        else:
+            print("Model has no variables. Skipping Step 1.")
+            for key in model_objs.keys(): scales[key] = 1.0
             
-        # Step 2
+        # === Step 2: 本番最適化 ===
+        # タイムアウトを短縮 (20s -> 5s)
+        client.parameters.timeout = 5000 
         print("\n=== [Step 2] Weighted Optimization ===")
-        w_constraint = weights.get('constraint', 1.0)
         
-        # ベースの制約項からスタート
+        w_constraint = weights.get('constraint', 1.0)
         model_final = model_constraints * w_constraint
-        print(f"Constraint: Weight = {w_constraint}")
-
+        
         for key, obj in model_objs.items():
             s = scales[key]
             w = weights.get(key, 1.0)
             model_final += (obj / s) * w
             print(f"{key}: Scale = {s:.4f}, Weight = {w}")
             
-        client.parameters.timeout = 20000 
-        
         # 最終モデルが定数でないか確認
         if not hasattr(model_final, 'evaluate'):
              raise Exception("最適化モデルに変数が含まれていません。候補リストを確認してください。")
 
         result = solve(model_final, client)
         
+        # グラフデータの作成
         plot_data = []
         solutions = []
         if hasattr(result, 'solutions'): solutions = result.solutions
@@ -280,6 +285,7 @@ class LogicHandler:
             plot_data.append({"time": float(t), "value": float(v)})
         plot_data.sort(key=lambda x: x['time'])
 
+        # グラフが見栄え良くなるようにダミーデータを補間（データが少なすぎる場合）
         if len(plot_data) < 5: 
             final_val = plot_data[-1]['value'] if plot_data else 0.0
             start_val = final_val * 1.5 if final_val > 0 else 10.0
@@ -294,23 +300,16 @@ class LogicHandler:
         if hasattr(result, 'best'): values = result.best.values
         elif isinstance(result, list) and len(result) > 0: values = result[0].values
         
-        step2_has_selection = False
-        if values is not None:
-            for i in range(len(candidates)):
-                if get_bit_value(values, i) > 0.5:
-                    step2_has_selection = True
-                    break
-        if not step2_has_selection and values_step1 is not None:
-             values = values_step1
-             print("Step 2 yield no selection. Reverting to Step 1 results.")
-        
+        # 結果の反映
         updated_candidates = []
         final_selected_len = 0
         
         print("\n=== Final Results ===")
         for i, c in enumerate(candidates):
-            val = get_bit_value(values, i)
+            # 修正: VariableGeneratorで作った変数のインデックス(i)を使って値を取得
+            val = get_val(values, i)
             c.selected = (val > 0.5)
+            
             if c.selected:
                 final_selected_len += len(c.text)
             updated_candidates.append(c.to_dict())
@@ -327,13 +326,20 @@ class LogicHandler:
         if not HAS_AMPLIFY: raise Exception("Amplify missing")
         candidates = [DraftItem.from_dict(d) for d in candidates_dict]
         
+        # Amplify v1: 変数生成
         gen = VariableGenerator()
         q = gen.array("Binary", len(candidates))
         
         h_param_diff = LogicHandler._construct_param_objective(q, candidates, params)
-        current_len = sum([len(c.text) * q[i] for i, c in enumerate(candidates)])
+        
+        # 文字数制約項
+        current_len_poly = 0
+        for i, c in enumerate(candidates):
+            current_len_poly += len(c.text) * q[i]
+            
         target = float(params['length'])
-        h_len_penalty = 0.001 * (current_len - target)**2
+        # ペナルティ法: (Sum(len) - target)^2
+        h_len_penalty = 0.001 * (current_len_poly - target)**2
         
         weights = { "diff": 1.0, "constraint": 1.0 }
         
@@ -349,6 +355,7 @@ class LogicHandler:
         if not HAS_AMPLIFY or not HAS_SKLEARN: raise Exception("Dependencies missing")
         candidates = [DraftItem.from_dict(d) for d in candidates_dict]
         
+        # SVRの学習データ作成
         X_train, y_train = [], []
         for rec in history:
             X_train.append(LogicHandler._create_vector(DraftItem(0, "", "", rec['relevance'], rec['attributes'])))
@@ -357,22 +364,29 @@ class LogicHandler:
         model_svr = SVR(kernel='rbf', C=10.0, epsilon=0.1)
         if X_train: model_svr.fit(X_train, y_train)
         
+        # 現在の候補に対する予測スコア
         current_vectors = [LogicHandler._create_vector(c) for c in candidates]
         predicted = model_svr.predict(current_vectors) if X_train else [3.0]*len(candidates)
         
         gen = VariableGenerator()
         q = gen.array("Binary", len(candidates))
         
+        # 目的関数: ユーザー好みの最大化（マイナスして最小化問題にする）
         h_user_pref = 0
         for i in range(len(candidates)):
-            # 【重要】NumPyの型(numpy.float64)だとAmplifyがエラーになるため、float()でキャスト
-            coeff = float(predicted[i])
-            h_user_pref -= coeff * q[i]
+            # 【重要修正】NumPyの型(numpy.float64)だとAmplifyがエラーになるため、確実に標準floatにキャスト
+            pred_score = float(predicted[i])
+            h_user_pref -= pred_score * q[i]
             
         h_param_diff = LogicHandler._construct_param_objective(q, candidates, params)
-        current_len = sum([len(c.text) * q[i] for i, c in enumerate(candidates)])
+        
+        # 文字数制約
+        current_len_poly = 0
+        for i, c in enumerate(candidates):
+            current_len_poly += len(c.text) * q[i]
+        
         target = float(params['length'])
-        h_len_penalty = 0.001 * (current_len - target)**2
+        h_len_penalty = 0.001 * (current_len_poly - target)**2
         
         weights = { "pref": 10.0, "diff": 1.0, "constraint": 1.0 }
         
