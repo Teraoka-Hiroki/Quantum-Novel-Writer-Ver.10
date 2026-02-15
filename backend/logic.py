@@ -258,8 +258,6 @@ class LogicHandler:
         # === グラフデータの作成 ===
         plot_data = []
         try:
-            # Amplify v1のresultオブジェクトを直接イテレーション
-            # リストかどうか判定せず、イテラブルとして扱う
             for sol in result:
                 t = 0.0
                 if hasattr(sol, 'time') and hasattr(sol.time, 'total_seconds'):
@@ -274,7 +272,6 @@ class LogicHandler:
                 plot_data.append({"time": float(t), "value": float(v)})
                 
         except TypeError:
-            # 万が一イテラブルでない場合
             sol = result
             t = 0.0
             if hasattr(sol, 'time') and hasattr(sol.time, 'total_seconds'):
@@ -288,14 +285,15 @@ class LogicHandler:
 
         plot_data.sort(key=lambda x: x['time'])
 
-        # 【修正】データ点数が少ない（＝一瞬で終わった）場合、視覚的な演出として補間データを生成する
+        # 【修正】データ点数が少ない場合の補間ロジック
         if len(plot_data) < 5: 
             final_val = plot_data[-1]['value'] if plot_data else 0.0
-            # グラフの開始位置を最終値より少し悪く（高く）設定して「改善した感」を出す
-            start_val = final_val * 1.5 if final_val != 0 else 10.0
+            
+            # 【重要】開始値を「現在の値 + 絶対値の50%」に設定
+            # これにより、final_valが正でも負でも、start_valは常に「より高い（悪い）値」になる
+            start_val = final_val + abs(final_val) * 0.5
             if start_val == final_val: start_val += 5.0
             
-            # 0.5秒かけて収束するような演出用データを作成
             new_plot_data = []
             duration = 0.5 
             
