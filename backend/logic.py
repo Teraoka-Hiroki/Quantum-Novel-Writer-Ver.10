@@ -196,8 +196,7 @@ class LogicHandler:
         client = FixstarsClient()
         client.token = token
         
-        # 【追加】ドキュメントに基づき、探索履歴（全ての解）を取得する設定
-        # これにより、探索過程で発見された複数の解がプロットデータに含まれるようになります
+        # すべての解を取得する設定（念のため）
         try:
             client.parameters.outputs.num_outputs = 0
         except:
@@ -259,30 +258,41 @@ class LogicHandler:
         # ソルバー実行
         result = solve(model_final, client)
         
-        # === グラフデータの作成（ドキュメント準拠） ===
+        # === 【修正】グラフデータの作成 ===
+        # result自体がイテラブルであるため、直接ループして全ての解を取り出す
         plot_data = []
-        solutions = []
-        if hasattr(result, 'solutions'): solutions = result.solutions
-        elif isinstance(result, list): solutions = result
-        else: solutions = [result]
-
-        for sol in solutions:
-            # 時間の取得 (timedelta -> seconds)
+        try:
+            # Amplify v1のresultオブジェクトを直接イテレーション
+            for sol in result:
+                # 時間の取得
+                t = 0.0
+                if hasattr(sol, 'time') and hasattr(sol.time, 'total_seconds'):
+                    t = sol.time.total_seconds()
+                
+                # 目的関数値の取得
+                v = 0.0
+                if hasattr(sol, 'objective'):
+                    v = sol.objective
+                elif hasattr(sol, 'energy'):
+                    v = sol.energy
+                    
+                plot_data.append({"time": float(t), "value": float(v)})
+                
+        except TypeError:
+            # 万が一イテラブルでない場合のフォールバック（単一解）
+            sol = result
             t = 0.0
             if hasattr(sol, 'time') and hasattr(sol.time, 'total_seconds'):
                 t = sol.time.total_seconds()
-            
-            # 目的関数値の取得 (v1では objective を使用)
             v = 0.0
             if hasattr(sol, 'objective'):
                 v = sol.objective
             elif hasattr(sol, 'energy'):
                 v = sol.energy
-                
             plot_data.append({"time": float(t), "value": float(v)})
-            
+
+        # 時間順にソート
         plot_data.sort(key=lambda x: x['time'])
-        # ※以前の「データが少ない場合に補間するロジック」は削除しました
 
         values = None
         if hasattr(result, 'best'): values = result.best.values
