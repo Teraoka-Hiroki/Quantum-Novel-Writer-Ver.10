@@ -32,7 +32,6 @@ class DraftItem:
         self.text = text
         self.type = type
         self.relevance = float(relevance)
-        # JSON復元時のガード
         self.attributes = attributes if isinstance(attributes, dict) else {}
         self.selected = selected
         self.user_rating = int(user_rating)
@@ -197,12 +196,17 @@ class LogicHandler:
         client = FixstarsClient()
         client.token = token
         
-        # 【重要】結果取得用ヘルパー関数：変数を直接評価して値(0 or 1)を取得する
+        # 【追加】ドキュメントに基づき、探索履歴（全ての解）を取得する設定
+        # これにより、探索過程で発見された複数の解がプロットデータに含まれるようになります
+        try:
+            client.parameters.outputs.num_outputs = 0
+        except:
+            pass
+        
+        # 結果取得用ヘルパー
         def get_val(values, variable):
             if values is None: return 0
             try:
-                # VariableGeneratorの変数を直接evaluateメソッドで評価
-                # これが最も確実な値の取り出し方です
                 return variable.evaluate(values)
             except:
                 return 0
@@ -222,7 +226,6 @@ class LogicHandler:
                 values_step1 = result_step1[0].values
 
             if values_step1 is not None:
-                # 修正: q[i]を直接渡す
                 approx_len = sum([len(c.text) for i, c in enumerate(candidates) if get_val(values_step1, q[i]) > 0.5])
                 print(f"Step1 Approx Length: {approx_len} (Target: {target_length})")
                 
@@ -238,12 +241,10 @@ class LogicHandler:
             for key in model_objs.keys(): scales[key] = 1.0
             
         # Step 2
-        # タイムアウトを10秒に延長して解の探索時間を確保
         client.parameters.timeout = 10000 
         print("\n=== [Step 2] Weighted Optimization ===")
         
         w_constraint = weights.get('constraint', 1.0)
-        # 制約の重みを少し強くする (x1.5)
         model_final = model_constraints * (w_constraint * 1.5)
         
         for key, obj in model_objs.items():
@@ -255,8 +256,10 @@ class LogicHandler:
         if not hasattr(model_final, 'evaluate'):
              raise Exception("最適化モデルに変数が含まれていません。")
 
+        # ソルバー実行
         result = solve(model_final, client)
         
+        # === グラフデータの作成（ドキュメント準拠） ===
         plot_data = []
         solutions = []
         if hasattr(result, 'solutions'): solutions = result.solutions
@@ -264,31 +267,30 @@ class LogicHandler:
         else: solutions = [result]
 
         for sol in solutions:
-            t = getattr(sol, 'time', 0.0)
-            if hasattr(t, 'total_seconds'): t = t.total_seconds()
-            v = getattr(sol, 'energy', 0)
+            # 時間の取得 (timedelta -> seconds)
+            t = 0.0
+            if hasattr(sol, 'time') and hasattr(sol.time, 'total_seconds'):
+                t = sol.time.total_seconds()
+            
+            # 目的関数値の取得 (v1では objective を使用)
+            v = 0.0
+            if hasattr(sol, 'objective'):
+                v = sol.objective
+            elif hasattr(sol, 'energy'):
+                v = sol.energy
+                
             plot_data.append({"time": float(t), "value": float(v)})
+            
         plot_data.sort(key=lambda x: x['time'])
-
-        if len(plot_data) < 5: 
-            final_val = plot_data[-1]['value'] if plot_data else 0.0
-            start_val = final_val * 1.5 if final_val > 0 else 10.0
-            if start_val == final_val: start_val += 5.0
-            plot_data = []
-            for i in range(11):
-                t = i * 0.1
-                val = final_val + (start_val - final_val) * ((1.0 - t)**2)
-                plot_data.append({"time": t, "value": val})
+        # ※以前の「データが少ない場合に補間するロジック」は削除しました
 
         values = None
         if hasattr(result, 'best'): values = result.best.values
         elif isinstance(result, list) and len(result) > 0: values = result[0].values
         
-        # フォールバック判定：Step2で何も選択されなかった場合、Step1の結果を採用
         step2_has_selection = False
         if values is not None:
             for i in range(len(candidates)):
-                # 修正: q[i]を直接渡して評価
                 if get_val(values, q[i]) > 0.5:
                     step2_has_selection = True
                     break
@@ -302,7 +304,6 @@ class LogicHandler:
         
         print("\n=== Final Results ===")
         for i, c in enumerate(candidates):
-            # 修正: q[i]を直接渡して評価
             val = get_val(values, q[i])
             c.selected = (val > 0.5)
             if c.selected:
@@ -362,7 +363,6 @@ class LogicHandler:
         
         h_user_pref = 0
         for i in range(len(candidates)):
-            # floatキャスト
             pred_score = float(predicted[i])
             h_user_pref -= pred_score * q[i]
             
